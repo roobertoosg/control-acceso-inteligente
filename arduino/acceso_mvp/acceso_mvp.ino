@@ -1,4 +1,5 @@
 #include <Servo.h>
+#include <SoftwareSerial.h>
 
 Servo barrera;
 
@@ -11,15 +12,19 @@ const int PIN_LED_VERDE  = 2;
 const int PIN_LED_ROJO   = 3;
 const int PIN_BUZZER     = 4;
 
+// RDM6300
+const int PIN_RDM_RX     = 10;   // Arduino RX <- TX del RDM6300
+const int PIN_RDM_TX     = 11;   // No se usa realmente, pero ponlo
+
+SoftwareSerial rdmSerial(PIN_RDM_RX, PIN_RDM_TX);
+
 // -------------------------
 // Configuración del sensor
-// Cambia a false si tu sensor se activa en HIGH
 // -------------------------
 const bool SENSOR_ACTIVO_EN_LOW = true;
 
 // -------------------------
 // Posiciones del servo
-// Ajusta según tu maqueta
 // -------------------------
 const int POS_CERRADO = 0;
 const int POS_ABIERTO = 90;
@@ -32,18 +37,20 @@ bool pasoYaReportado = false;
 unsigned long ultimoCambioSensor = 0;
 const unsigned long DEBOUNCE_MS = 250;
 
+// Antirrebote RFID
+String ultimoUid = "";
+unsigned long ultimoUidMs = 0;
+const unsigned long UID_LOCK_MS = 1500;
+
 String bufferSerial = "";
+String bufferRFID = "";
 
 // --------------------------------------------------
 // Utilidades
 // --------------------------------------------------
 bool sensorDetectado() {
   int lectura = digitalRead(PIN_SENSOR_IR);
-  if (SENSOR_ACTIVO_EN_LOW) {
-    return lectura == LOW;
-  } else {
-    return lectura == HIGH;
-  }
+  return SENSOR_ACTIVO_EN_LOW ? (lectura == LOW) : (lectura == HIGH);
 }
 
 void apagarIndicadores() {
@@ -64,7 +71,7 @@ void abrirAcceso() {
   pasoYaReportado = false;
 }
 
-void beepCorto(int ms = 150) {
+void beepCorto(int ms = 120) {
   digitalWrite(PIN_BUZZER, HIGH);
   delay(ms);
   digitalWrite(PIN_BUZZER, LOW);
@@ -131,11 +138,42 @@ void procesarComando(String cmd) {
   }
 }
 
+bool leerUidRDM(String &uid) {
+  while (rdmSerial.available() > 0) {
+    char c = (char)rdmSerial.read();
+
+    if ((uint8_t)c == 0x02) {   // STX
+      bufferRFID = "";
+    }
+    else if ((uint8_t)c == 0x03) { // ETX
+      if (bufferRFID.length() >= 10) {
+        uid = bufferRFID.substring(0, 10); // tomamos los 10 primeros hex
+        uid.toUpperCase();
+        bufferRFID = "";
+        return true;
+      }
+      bufferRFID = "";
+    }
+    else if (isHexadecimalDigit(c)) {
+      bufferRFID += c;
+      if (bufferRFID.length() > 12) {
+        bufferRFID.remove(0, bufferRFID.length() - 12);
+      }
+    }
+  }
+  return false;
+}
+
+bool esUidRepetidoReciente(const String &uid) {
+  return (uid == ultimoUid) && ((millis() - ultimoUidMs) < UID_LOCK_MS);
+}
+
 // --------------------------------------------------
 // Setup
 // --------------------------------------------------
 void setup() {
   Serial.begin(9600);
+  rdmSerial.begin(9600);
 
   pinMode(PIN_SENSOR_IR, INPUT);
   pinMode(PIN_LED_VERDE, OUTPUT);
@@ -153,7 +191,7 @@ void setup() {
 // Loop principal
 // --------------------------------------------------
 void loop() {
-  // 1) Leer comandos seriales sin bloquear
+  // 1) Leer comandos desde Python por USB serial
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
 
@@ -167,7 +205,18 @@ void loop() {
     }
   }
 
-  // 2) Detectar paso cuando el acceso está abierto
+  // 2) Leer RFID desde RDM6300
+  String uidLeido = "";
+  if (leerUidRDM(uidLeido)) {
+    if (!esUidRepetidoReciente(uidLeido)) {
+      ultimoUid = uidLeido;
+      ultimoUidMs = millis();
+      Serial.print("EVENTO:RFID:");
+      Serial.println(uidLeido);
+    }
+  }
+
+  // 3) Detectar paso cuando el acceso está abierto
   bool hayPaso = sensorDetectado();
 
   if (accesoAbierto && !pasoYaReportado && hayPaso) {
