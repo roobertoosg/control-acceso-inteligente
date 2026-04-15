@@ -1,10 +1,3 @@
-"""
-Capa de Acceso a Datos (Database Wrapper).
-
-Esta clase centraliza todas las interacciones con PostgreSQL. El objetivo es
-mantener el SQL aislado de la lógica de negocio (main.py, anomaly_logic.py).
-Usamos psycopg2 con RealDictCursor para devolver los resultados como diccionarios.
-"""
 from __future__ import annotations
 
 import psycopg2
@@ -12,14 +5,6 @@ from psycopg2.extras import RealDictCursor
 
 
 class Database:
-    """
-    Gestor de conexiones y consultas a la base de datos de Control de Acceso.
-    
-    Importante: Mantenemos `autocommit=False` por defecto. Esto significa que
-    los métodos que modifican datos (`insert_evento`, `update_estado_usuario`)
-    requieren que el invocador llame a `commit()` explícitamente para asegurar
-    la atomicidad de las transacciones.
-    """
     
     def __init__(self, host: str, port: int, dbname: str, user: str, password: str):
         self.conn = psycopg2.connect(
@@ -37,7 +22,6 @@ class Database:
             self.conn.close()
 
     def get_usuario_by_uid(self, uid_rfid: str) -> dict | None:
-        """Recupera los datos críticos de un usuario escaneando su tarjeta RFID."""
         sql = """
             SELECT
                 id_usuario,
@@ -99,10 +83,6 @@ class Database:
         anomalia_score: int,
         detalle: str | None = None,
     ) -> int:
-        """
-        Registra un evento en la bitácora principal (`eventos_acceso`).
-        Retorna el `id_evento` generado.
-        """
         sql = """
             INSERT INTO acceso.eventos_acceso (
                 id_usuario,
@@ -146,7 +126,6 @@ class Database:
             return row["id_evento"]
 
     def update_estado_usuario(self, id_usuario: int, nuevo_estado: str) -> None:
-        """Actualiza la ubicación lógica del usuario (DENTRO o FUERA) tras un acceso exitoso."""
         sql = """
             UPDATE acceso.usuarios
             SET estado_actual = %s
@@ -160,9 +139,7 @@ class Database:
 
     def rollback(self) -> None:
         self.conn.rollback()
-
     def get_horarios_usuario(self, id_usuario: int) -> list[dict]:
-        """Obtiene la plantilla de horarios completa de un usuario para cálculo de anomalías e inasistencias."""
         sql = """
             SELECT
                 id_horario,
