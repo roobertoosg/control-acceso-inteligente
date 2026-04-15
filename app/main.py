@@ -1,16 +1,31 @@
+"""
+Punto de Entrada Principal (Main Loop y Orquestador).
+
+Este módulo actúa como el controlador principal de nuestro sistema embebido/servidor.
+Su responsabilidad es:
+1. Inicializar las conexiones (Base de Datos, Puerto Serial).
+2. Levantar hilos (threads) paralelos para escuchar eventos físicos (RFID) y manuales (consola).
+3. Encolar estos eventos y procesarlos secuencialmente para evitar condiciones de carrera en la BD.
+4. Orquestar el flujo completo: Leer UID -> Decidir Acceso -> Activar Hardware -> Evaluar Anomalías -> Guardar.
+"""
+
 from __future__ import annotations
 
 import queue
 import threading
 import time
+from datetime import datetime
 from typing import Optional, Tuple
 
+from .access_logic import decidir_evento
+from .anomaly_logic import (
+    evaluar_denegacion,
+    evaluar_evento_permitido_completado,
+)
 from .config import Config
 from .db import Database
 from .serial_manager import SerialManager
-from .access_logic import decidir_evento
 from .utils import log
-from .anomaly_logic import evaluar_anomalia_evento_completado
 
 
 UidEvent = Tuple[str, str]      # (source, uid)
@@ -34,6 +49,11 @@ def wait_for_queue_event(
     expected_type: str,
     timeout_seconds: int,
 ) -> bool:
+    """
+    Espera activamente en la cola de eventos de hardware por un mensaje específico.
+    Se usa principalmente para esperar la confirmación de "paso detectado" (sensor IR)
+    después de abrir la puerta, con un tiempo límite definido.
+    """
     limite = time.time() + timeout_seconds
 
     while time.time() < limite:
@@ -59,15 +79,24 @@ def procesar_uid(
     uid: str,
     source: str,
 ) -> None:
+    """
+    Núcleo del procesamiento de un intento de acceso.
+    
+    Flujo:
+    1. Consulta el estado del usuario.
+    2. Pide permiso a `access_logic.py`.
+    3. Si se permite, interactúa con el Arduino para abrir el servo y espera el paso.
+    4. Evalúa posibles anomalías con `anomaly_logic.py` y registra todo en PostgreSQL.
+    """
     uid = normalizar_uid(uid)
 
     if not uid:
         log("UID vacío, se ignora")
         return
 
+    event_dt = datetime.now().astimezone()
     usuario = db.get_usuario_by_uid(uid)
     decision = decidir_evento(usuario)
-    motivo = db.get_motivo_by_codigo(decision["motivo_codigo"])
 
     log(f"UID recibido desde [{source}]: {uid}")
 
@@ -93,28 +122,52 @@ def procesar_uid(
     if not decision["permitido"]:
         log("Acceso denegado")
 
+        analisis_denegacion = evaluar_denegacion(
+            db=db,
+            uid_rfid=uid,
+            usuario=usuario,
+            decision=decision,
+            event_dt=event_dt,
+        )
+
+        motivo = db.get_motivo_by_codigo(analisis_denegacion["motivo_codigo"])
+
         if serial_mgr is not None:
             try:
                 serial_mgr.send_command("CMD:DENEGAR")
             except Exception as exc:
                 log(f"No se pudo enviar CMD:DENEGAR: {exc}")
 
+        detalle = decision["detalle"]
+        if analisis_denegacion["detalle_extra"]:
+            detalle = f"{detalle} | {analisis_denegacion['detalle_extra']}"
+        detalle = f"{detalle} | source={source}"
+
         db.insert_evento(
             id_usuario=usuario["id_usuario"] if usuario else None,
             uid_rfid_leido=uid,
             id_punto=punto["id_punto"],
             modo_evento=decision["modo_evento"],
-            resultado=decision["resultado"],
+            resultado=analisis_denegacion["resultado"],
             id_motivo=motivo["id_motivo"],
             estado_anterior=decision["estado_anterior"],
             estado_nuevo=decision["estado_nuevo"],
             paso_detectado=False,
             servo_activado=False,
-            anomalia_score=0,
-            detalle=f"{decision['detalle']} | source={source}",
+            anomalia_score=analisis_denegacion["anomalia_score"],
+            detalle=detalle,
         )
         db.commit()
-        log("Evento denegado registrado en BD")
+
+        if analisis_denegacion["es_anomalia"]:
+            log(
+                f"Denegación marcada como ANOMALIA | "
+                f"motivo={analisis_denegacion['motivo_codigo']} | "
+                f"score={analisis_denegacion['anomalia_score']}"
+            )
+        else:
+            log("Evento denegado registrado en BD")
+
         return
 
     # ------------------------------------------------------
@@ -126,7 +179,6 @@ def procesar_uid(
     servo_activado = serial_mgr is not None
 
     if serial_mgr is not None:
-        # Limpiamos eventos previos de paso antes de autorizar
         vaciar_cola(event_queue)
 
         try:
@@ -140,61 +192,94 @@ def procesar_uid(
             timeout_seconds=Config.PASO_TIMEOUT,
         )
     else:
-        # Modo sin serial: simulación para poder avanzar y demostrar flujo
+        # Para demo / modo manual
         log("Modo sin serial activo: simulando paso detectado")
         paso_ok = True
         servo_activado = False
 
-    if paso_ok:
-        log("Paso detectado, evaluando si el evento permitido cae en anomalía")
-
-        analisis = evaluar_anomalia_evento_completado(
-            db=db,
-            usuario=usuario,
-            decision=decision,
-        )
-
-        motivo_final = db.get_motivo_by_codigo(analisis["motivo_codigo"])
-
-        detalle_final = decision["detalle"]
-        if analisis["detalle_extra"]:
-            detalle_final = f"{detalle_final} | {analisis['detalle_extra']}"
-        detalle_final = f"{detalle_final} | source={source}"
+    # ------------------------------------------------------
+    # CASO: EVENTO INCOMPLETO
+    # ------------------------------------------------------
+    if not paso_ok:
+        log("No hubo paso detectado dentro del tiempo límite")
+        motivo_timeout = db.get_motivo_by_codigo("EVENTO_INCOMPLETO_TIMEOUT")
 
         db.insert_evento(
             id_usuario=usuario["id_usuario"],
             uid_rfid_leido=uid,
             id_punto=punto["id_punto"],
             modo_evento=decision["modo_evento"],
-            resultado=analisis["resultado"],
-            id_motivo=motivo_final["id_motivo"],
+            resultado="INCOMPLETO",
+            id_motivo=motivo_timeout["id_motivo"],
             estado_anterior=decision["estado_anterior"],
-            estado_nuevo=decision["estado_nuevo"],
-            paso_detectado=True,
+            estado_nuevo=decision["estado_anterior"],
+            paso_detectado=False,
             servo_activado=servo_activado,
-            anomalia_score=analisis["anomalia_score"],
-            detalle=detalle_final,
+            anomalia_score=0,
+            detalle=f"Se autorizó el acceso, pero no se detectó paso | source={source}",
         )
-
-        db.update_estado_usuario(usuario["id_usuario"], decision["estado_nuevo"])
         db.commit()
-
-        if analisis["es_anomalia"]:
-            log(
-                f"Evento registrado como ANOMALIA | "
-                f"motivo={analisis['motivo_codigo']} | "
-                f"score={analisis['anomalia_score']}"
-            )
-        else:
-            log(f"Evento registrado. Nuevo estado del usuario: {decision['estado_nuevo']}")
 
         if serial_mgr is not None:
             try:
                 serial_mgr.send_command("CMD:CERRAR")
             except Exception as exc:
-                log(f"No se pudo enviar CMD:CERRAR: {exc}")
+                log(f"No se pudo enviar CMD:CERRAR tras timeout: {exc}")
 
+        log("Evento incompleto registrado")
         return
+
+    # ------------------------------------------------------
+    # CASO: PASO DETECTADO -> EVALUAR ANOMALÍAS
+    # ------------------------------------------------------
+    log("Paso detectado, evaluando anomalías del acceso completado")
+
+    analisis = evaluar_evento_permitido_completado(
+        db=db,
+        usuario=usuario,
+        decision=decision,
+        event_dt=event_dt,
+    )
+
+    motivo_final = db.get_motivo_by_codigo(analisis["motivo_codigo"])
+
+    detalle_final = decision["detalle"]
+    if analisis["detalle_extra"]:
+        detalle_final = f"{detalle_final} | {analisis['detalle_extra']}"
+    detalle_final = f"{detalle_final} | source={source}"
+
+    db.insert_evento(
+        id_usuario=usuario["id_usuario"],
+        uid_rfid_leido=uid,
+        id_punto=punto["id_punto"],
+        modo_evento=decision["modo_evento"],
+        resultado=analisis["resultado"],
+        id_motivo=motivo_final["id_motivo"],
+        estado_anterior=decision["estado_anterior"],
+        estado_nuevo=decision["estado_nuevo"],
+        paso_detectado=True,
+        servo_activado=servo_activado,
+        anomalia_score=analisis["anomalia_score"],
+        detalle=detalle_final,
+    )
+
+    db.update_estado_usuario(usuario["id_usuario"], decision["estado_nuevo"])
+    db.commit()
+
+    if analisis["es_anomalia"]:
+        log(
+            f"Evento registrado como ANOMALIA | "
+            f"motivo={analisis['motivo_codigo']} | "
+            f"score={analisis['anomalia_score']}"
+        )
+    else:
+        log(f"Evento registrado. Nuevo estado del usuario: {decision['estado_nuevo']}")
+
+    if serial_mgr is not None:
+        try:
+            serial_mgr.send_command("CMD:CERRAR")
+        except Exception as exc:
+            log(f"No se pudo enviar CMD:CERRAR: {exc}")
 
 
 def serial_listener(
@@ -204,13 +289,11 @@ def serial_listener(
     stop_event: threading.Event,
 ) -> None:
     """
-    Único lector del puerto serial.
-    Espera mensajes tipo:
-      EVENTO:RFID:ABC123
-      EVENTO:PASO
-      SISTEMA:LISTO
-      ESTADO:...
-      ERROR:...
+    Hilo de Escucha del Hardware (Arduino).
+    
+    Este hilo se dedica exclusivamente a leer el puerto serial sin bloquear el hilo principal.
+    Cuando detecta una lectura RFID o un evento de paso, lo empaqueta y lo pone en las
+    colas seguras (thread-safe) para que el hilo principal lo procese.
     """
     log("Hilo serial activo, esperando mensajes del Arduino...")
 
@@ -231,11 +314,6 @@ def serial_listener(
             elif msg == "EVENTO:PASO":
                 event_queue.put(("paso", msg))
 
-            else:
-                # Estados informativos del Arduino: SISTEMA:..., ESTADO:..., ERROR:...
-                # Solo se registran en log por ahora.
-                pass
-
         except Exception as exc:
             log(f"Error en listener serial: {exc}")
             break
@@ -245,7 +323,10 @@ def serial_listener(
 
 def console_listener(uid_queue: queue.Queue, stop_event: threading.Event) -> None:
     """
-    Siempre permite capturar UIDs manualmente desde consola.
+    Hilo de Escucha de Consola (Modo Debug/Manual).
+    
+    Permite a los desarrolladores o administradores inyectar UIDs manualmente a través
+    de la terminal para simular lecturas RFID sin necesitar el hardware físico.
     """
     log("Hilo de consola activo. Puedes escribir UID manual o 'salir'.")
 
@@ -287,6 +368,11 @@ def preguntar_si_usa_serial() -> bool:
 
 
 def main() -> None:
+    """
+    Punto de arranque de la aplicación.
+    Configura el entorno, decide si usar hardware físico o modo de prueba,
+    levanta los hilos de escucha y comienza el loop infinito de procesamiento de eventos.
+    """
     log("Iniciando sistema...")
 
     db = Database(
@@ -325,18 +411,14 @@ def main() -> None:
         uid_queue: queue.Queue[UidEvent] = queue.Queue()
         event_queue: queue.Queue[DeviceEvent] = queue.Queue()
         stop_event = threading.Event()
-        threads: list[threading.Thread] = []
 
-        # Consola siempre activa
         t_console = threading.Thread(
             target=console_listener,
             args=(uid_queue, stop_event),
             daemon=True,
         )
         t_console.start()
-        threads.append(t_console)
 
-        # Serial opcional
         if serial_mgr is not None:
             t_serial = threading.Thread(
                 target=serial_listener,
@@ -344,7 +426,6 @@ def main() -> None:
                 daemon=True,
             )
             t_serial.start()
-            threads.append(t_serial)
 
         log("Sistema listo. Esperando UID manual o RFID físico...")
 

@@ -1,3 +1,9 @@
+"""
+Configuración del Entorno.
+
+Centraliza todas las variables de entorno (cargadas desde el archivo .env).
+Proporciona valores por defecto seguros para facilitar el desarrollo local.
+"""
 import os
 from dotenv import load_dotenv
 

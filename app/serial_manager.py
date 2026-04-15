@@ -1,3 +1,11 @@
+"""
+Administrador de Comunicaciones Seriales.
+
+Este módulo encapsula la librería `pyserial`. Su único propósito es servir
+de puente entre nuestro backend en Python y el microcontrolador (Arduino/ESP)
+que controla físicamente la lectura de las tarjetas RFID, la apertura del servo,
+y la lectura del sensor infrarrojo de paso.
+"""
 import time
 from typing import Optional
 

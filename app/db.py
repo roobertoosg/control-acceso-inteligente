@@ -1,3 +1,10 @@
+"""
+Capa de Acceso a Datos (Database Wrapper).
+
+Esta clase centraliza todas las interacciones con PostgreSQL. El objetivo es
+mantener el SQL aislado de la lógica de negocio (main.py, anomaly_logic.py).
+Usamos psycopg2 con RealDictCursor para devolver los resultados como diccionarios.
+"""
 from __future__ import annotations
 
 import psycopg2
@@ -5,6 +12,15 @@ from psycopg2.extras import RealDictCursor
 
 
 class Database:
+    """
+    Gestor de conexiones y consultas a la base de datos de Control de Acceso.
+    
+    Importante: Mantenemos `autocommit=False` por defecto. Esto significa que
+    los métodos que modifican datos (`insert_evento`, `update_estado_usuario`)
+    requieren que el invocador llame a `commit()` explícitamente para asegurar
+    la atomicidad de las transacciones.
+    """
+    
     def __init__(self, host: str, port: int, dbname: str, user: str, password: str):
         self.conn = psycopg2.connect(
             host=host,
@@ -21,6 +37,7 @@ class Database:
             self.conn.close()
 
     def get_usuario_by_uid(self, uid_rfid: str) -> dict | None:
+        """Recupera los datos críticos de un usuario escaneando su tarjeta RFID."""
         sql = """
             SELECT
                 id_usuario,
@@ -82,6 +99,10 @@ class Database:
         anomalia_score: int,
         detalle: str | None = None,
     ) -> int:
+        """
+        Registra un evento en la bitácora principal (`eventos_acceso`).
+        Retorna el `id_evento` generado.
+        """
         sql = """
             INSERT INTO acceso.eventos_acceso (
                 id_usuario,
@@ -125,6 +146,7 @@ class Database:
             return row["id_evento"]
 
     def update_estado_usuario(self, id_usuario: int, nuevo_estado: str) -> None:
+        """Actualiza la ubicación lógica del usuario (DENTRO o FUERA) tras un acceso exitoso."""
         sql = """
             UPDATE acceso.usuarios
             SET estado_actual = %s
@@ -138,3 +160,93 @@ class Database:
 
     def rollback(self) -> None:
         self.conn.rollback()
+
+    def get_horarios_usuario(self, id_usuario: int) -> list[dict]:
+        """Obtiene la plantilla de horarios completa de un usuario para cálculo de anomalías e inasistencias."""
+        sql = """
+            SELECT
+                id_horario,
+                id_usuario,
+                dia_semana,
+                hora_inicio,
+                hora_fin,
+                materia,
+                activo
+            FROM acceso.horarios_usuario
+            WHERE id_usuario = %s
+            ORDER BY dia_semana, hora_inicio
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (id_usuario,))
+            return cur.fetchall() or []
+
+    def get_ultima_entrada_valida(self, id_usuario: int, before_dt=None) -> dict | None:
+        sql = """
+            SELECT
+                id_evento,
+                id_usuario,
+                fecha_hora,
+                modo_evento,
+                resultado,
+                paso_detectado
+            FROM acceso.eventos_acceso
+            WHERE id_usuario = %s
+              AND modo_evento = 'ENTRADA'
+              AND paso_detectado = TRUE
+              AND resultado IN ('PERMITIDO', 'ANOMALIA')
+              AND (%s IS NULL OR fecha_hora < %s)
+            ORDER BY fecha_hora DESC, id_evento DESC
+            LIMIT 1
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (id_usuario, before_dt, before_dt))
+            return cur.fetchone()
+
+    def get_ultima_salida_valida(self, id_usuario: int, before_dt=None) -> dict | None:
+        sql = """
+            SELECT
+                id_evento,
+                id_usuario,
+                fecha_hora,
+                modo_evento,
+                resultado,
+                paso_detectado
+            FROM acceso.eventos_acceso
+            WHERE id_usuario = %s
+              AND modo_evento = 'SALIDA'
+              AND paso_detectado = TRUE
+              AND resultado IN ('PERMITIDO', 'ANOMALIA')
+              AND (%s IS NULL OR fecha_hora < %s)
+            ORDER BY fecha_hora DESC, id_evento DESC
+            LIMIT 1
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (id_usuario, before_dt, before_dt))
+            return cur.fetchone()
+
+    def count_movimientos_usuario_dia(self, id_usuario: int, fecha_ref) -> int:
+        sql = """
+            SELECT COUNT(*) AS total
+            FROM acceso.eventos_acceso
+            WHERE id_usuario = %s
+              AND DATE(fecha_hora) = DATE(%s)
+              AND resultado IN ('PERMITIDO', 'ANOMALIA', 'INCOMPLETO', 'DENEGADO')
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (id_usuario, fecha_ref))
+            row = cur.fetchone()
+            return int(row["total"] or 0)
+
+    def count_denegados_recientes_por_uid(self, uid_rfid_leido: str, minutos: int, fecha_ref) -> int:
+        sql = """
+            SELECT COUNT(*) AS total
+            FROM acceso.eventos_acceso
+            WHERE uid_rfid_leido = %s
+              AND resultado = 'DENEGADO'
+              AND fecha_hora >= (%s - (%s || ' minutes')::interval)
+              AND fecha_hora < %s
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (uid_rfid_leido, fecha_ref, minutos, fecha_ref))
+            row = cur.fetchone()
+            return int(row["total"] or 0)
