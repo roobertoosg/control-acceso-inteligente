@@ -86,9 +86,6 @@ def decidir_evento(usuario: dict | None) -> dict:
             "detalle": "Salida autorizada",
         }
 
-    # 5. Red de seguridad (Fallback)
-    # Atrapa cualquier estado inconsistente en la base de datos que no hayamos
-    # contemplado (por ejemplo, si alguien inserta un estado 'EN_SALA_DE_ESPERA').
     return {
         "permitido": False,
         "modo_evento": "ENTRADA",
