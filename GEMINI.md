@@ -1,0 +1,1 @@
+Este es un sistema de control de acceso con Arduino y Python. Siempre que sugieras cambios, prioriza la seguridad: si una barrera se abre, debe cerrarse por timeout si no hay paso detectado.

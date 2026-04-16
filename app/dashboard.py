@@ -13,7 +13,7 @@ import plotly.express as px
 import psycopg2
 import streamlit as st
 
-from app.config import Config
+from config import Config
 
 
 st.set_page_config(

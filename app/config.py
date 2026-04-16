@@ -23,3 +23,12 @@ class Config:
     DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
 
     PUNTO_ACCESO = os.getenv("PUNTO_ACCESO", "Acceso Principal")
+
+    # --- NUEVOS LÍMITES DEL ALCOHOLÍMETRO ---
+    ALCOHOL_MAX_PERMITIDO = int(os.getenv("ALCOHOL_MAX_PERMITIDO", "400"))
+    ALCOHOL_ADVERTENCIA = int(os.getenv("ALCOHOL_ADVERTENCIA", "300"))
+
+    # --- NUEVOS LÍMITES TEMPERATURA (MLX90614) ---
+    TEMP_MIN_VALIDA = 34.0    # Menos de esto es mala posición (aire frío)
+    TEMP_MAX_NORMAL = 37.4    # Rango saludable
+    TEMP_FIEBRE = 38.0        # Bloqueo inmediato

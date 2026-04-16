@@ -1,12 +1,5 @@
 """
 Punto de Entrada Principal (Main Loop y Orquestador).
-
-Este módulo actúa como el controlador principal de nuestro sistema embebido/servidor.
-Su responsabilidad es:
-1. Inicializar las conexiones (Base de Datos, Puerto Serial).
-2. Levantar hilos (threads) paralelos para escuchar eventos físicos (RFID) y manuales (consola).
-3. Encolar estos eventos y procesarlos secuencialmente para evitar condiciones de carrera en la BD.
-4. Orquestar el flujo completo: Leer UID -> Decidir Acceso -> Activar Hardware -> Evaluar Anomalías -> Guardar.
 """
 
 from __future__ import annotations
@@ -28,9 +21,9 @@ from .serial_manager import SerialManager
 from .utils import log
 
 
-UidEvent = Tuple[str, str]      # (source, uid)
-DeviceEvent = Tuple[str, str]   # (event_type, raw_message)
-
+# Volvemos a solo 2 datos, porque el alcohol se manejará como un evento separado
+UidEvent = Tuple[str, str]      
+DeviceEvent = Tuple[str, dict]  # (event_type, {'alcohol': 150, 'temp': 36.5}) o (event_type, raw_message)
 
 def normalizar_uid(uid: str) -> str:
     return (uid or "").strip().upper()
@@ -48,11 +41,10 @@ def wait_for_queue_event(
     event_queue: queue.Queue,
     expected_type: str,
     timeout_seconds: int,
-) -> bool:
+) -> str | None:
     """
-    Espera activamente en la cola de eventos de hardware por un mensaje específico.
-    Se usa principalmente para esperar la confirmación de "paso detectado" (sensor IR)
-    después de abrir la puerta, con un tiempo límite definido.
+    Espera activamente en la cola por un evento. 
+    Retorna el valor del evento si lo encuentra, o None si hay timeout.
     """
     limite = time.time() + timeout_seconds
 
@@ -66,9 +58,9 @@ def wait_for_queue_event(
         log(f"[QUEUE-EVENT] {event_type} -> {raw}")
 
         if event_type == expected_type:
-            return True
+            return raw
 
-    return False
+    return None
 
 
 def procesar_uid(
@@ -79,19 +71,10 @@ def procesar_uid(
     uid: str,
     source: str,
 ) -> None:
-    """
-    Núcleo del procesamiento de un intento de acceso.
     
-    Flujo:
-    1. Consulta el estado del usuario.
-    2. Pide permiso a `access_logic.py`.
-    3. Si se permite, interactúa con el Arduino para abrir el servo y espera el paso.
-    4. Evalúa posibles anomalías con `anomaly_logic.py` y registra todo en PostgreSQL.
-    """
     uid = normalizar_uid(uid)
 
     if not uid:
-        log("UID vacío, se ignora")
         return
 
     event_dt = datetime.now().astimezone()
@@ -108,13 +91,69 @@ def procesar_uid(
                 usuario.get("apellido_materno"),
             ] if x
         )
-        log(
-            f"Usuario encontrado: {nombre_completo} | "
-            f"Matrícula: {usuario.get('matricula')} | "
-            f"Estado actual: {usuario.get('estado_actual')}"
-        )
+        log(f"Usuario: {nombre_completo} | Estado actual: {usuario.get('estado_actual')}")
     else:
         log("Usuario no encontrado")
+
+    nivel_alcohol = 0
+    temperatura = 36.5 # Inicialización segura por si es manual
+
+    # ------------------------------------------------------
+    # LÓGICA DE SALUD (ALCOHOL + TEMPERATURA) SOLO EN ENTRADA
+    # ------------------------------------------------------
+    if decision["permitido"] and decision["modo_evento"] == "ENTRADA":
+        log("💳 Tarjeta de ENTRADA detectada.")
+        if serial_mgr is not None:
+            vaciar_cola(event_queue)
+            
+            serial_mgr.send_command("CMD:SOPLAR")
+            log("⏳ Por favor, acérquese al sensor y sople durante 10 segundos...")
+
+            # Esperamos hasta 12 segundos por el paquete de salud del Arduino
+            datos_salud = wait_for_queue_event(
+                event_queue=event_queue,
+                expected_type="salud",
+                timeout_seconds=12, 
+            )
+
+            if datos_salud is None:
+                log("❌ Error: No se recibieron datos de los sensores de salud.")
+                decision["permitido"] = False
+                decision["resultado"] = "INCOMPLETO"
+                decision["motivo_codigo"] = "EVENTO_INCOMPLETO_TIMEOUT"
+                decision["detalle"] = "Fallo al leer sensores de salud"
+            else:
+                # Extraemos los datos del diccionario
+                nivel_alcohol = datos_salud.get('alcohol', 0)
+                temperatura = datos_salud.get('temp', 0.0)
+                
+                log(f"🩺 Muestras capturadas -> Alcohol: {nivel_alcohol} | Temp: {temperatura}°C")
+                time.sleep(2) 
+                
+                # --- REGLAS DE SALUD (El Árbitro) ---
+                if nivel_alcohol >= Config.ALCOHOL_MAX_PERMITIDO:
+                    log(f"ALERTA ROJA: Nivel de alcohol ({nivel_alcohol}) supera el límite. Bloqueando.")
+                    decision["permitido"] = False
+                    decision["resultado"] = "DENEGADO"
+                    decision["motivo_codigo"] = "ALCOHOLIMETRO_POSITIVO"
+                    decision["detalle"] = f"Alcohol detectado: {nivel_alcohol}"
+                    
+                elif temperatura >= Config.TEMP_FIEBRE:
+                    log(f"ALERTA ROJA: Fiebre detectada ({temperatura}°C). Bloqueando por seguridad sanitaria.")
+                    decision["permitido"] = False
+                    decision["resultado"] = "DENEGADO"
+                    decision["motivo_codigo"] = "TEMPERATURA_ALTA"
+                    decision["detalle"] = f"Temperatura alta: {temperatura}°C"
+                    
+                elif temperatura < Config.TEMP_MIN_VALIDA:
+                    log(f"⚠️ Lectura de temperatura inválida ({temperatura}°C). Posible mala posición.")
+                    decision["permitido"] = False
+                    decision["resultado"] = "INCOMPLETO"
+                    decision["motivo_codigo"] = "TEMPERATURA_INVALIDA"
+                    decision["detalle"] = "Favor de acercarse al sensor y repetir la prueba."
+                    
+                else:
+                    log(f"✅ Estado de salud verificado. Autorizando acceso...")
 
     # ------------------------------------------------------
     # CASO: ACCESO DENEGADO
@@ -133,14 +172,32 @@ def procesar_uid(
         motivo = db.get_motivo_by_codigo(analisis_denegacion["motivo_codigo"])
 
         if serial_mgr is not None:
+            # Traducimos el motivo complejo de la BD a un comando corto para el Arduino
+            motivo_cod = analisis_denegacion["motivo_codigo"]
+            cmd_denegar = "CMD:DENEGAR:GENERICO"
+            
+            if motivo_cod == "ALCOHOLIMETRO_POSITIVO":
+                cmd_denegar = "CMD:DENEGAR:ALCOHOL"
+            elif motivo_cod == "TEMPERATURA_ALTA":
+                cmd_denegar = "CMD:DENEGAR:FIEBRE"
+            elif motivo_cod == "TEMPERATURA_INVALIDA":
+                cmd_denegar = "CMD:DENEGAR:MALATEMP"
+            elif motivo_cod == "USUARIO_NO_ENCONTRADO" or not usuario:
+                cmd_denegar = "CMD:DENEGAR:NO_REG"
+            elif "HORARIO" in motivo_cod or "CLASE" in motivo_cod:
+                cmd_denegar = "CMD:DENEGAR:HORARIO"
+
             try:
-                serial_mgr.send_command("CMD:DENEGAR")
+                serial_mgr.send_command(cmd_denegar)
             except Exception as exc:
-                log(f"No se pudo enviar CMD:DENEGAR: {exc}")
+                log(f"No se pudo enviar {cmd_denegar}: {exc}")
 
         detalle = decision["detalle"]
         if analisis_denegacion["detalle_extra"]:
-            detalle = f"{detalle} | {analisis_denegacion['detalle_extra']}"
+            detalle = f"{detalle} | {analisis_denegacion['detalle_extra']}"      
+        # --- NUEVO: Agregar evidencia de salud al log ---
+        if decision["modo_evento"] == "ENTRADA" and nivel_alcohol > 0:
+            detalle = f"{detalle} | Alc:{nivel_alcohol} Temp:{temperatura}°C"
         detalle = f"{detalle} | source={source}"
 
         db.insert_evento(
@@ -160,14 +217,9 @@ def procesar_uid(
         db.commit()
 
         if analisis_denegacion["es_anomalia"]:
-            log(
-                f"Denegación marcada como ANOMALIA | "
-                f"motivo={analisis_denegacion['motivo_codigo']} | "
-                f"score={analisis_denegacion['anomalia_score']}"
-            )
+            log(f"Denegación ANOMALIA | motivo={analisis_denegacion['motivo_codigo']} | score={analisis_denegacion['anomalia_score']}")
         else:
             log("Evento denegado registrado en BD")
-
         return
 
     # ------------------------------------------------------
@@ -182,17 +234,19 @@ def procesar_uid(
         vaciar_cola(event_queue)
 
         try:
-            serial_mgr.send_command("CMD:PERMITIR")
+            # Le avisamos al Arduino si es Entrada o Salida para el mensaje
+            tipo_acceso = "ENTRADA" if decision["modo_evento"] == "ENTRADA" else "SALIDA"
+            serial_mgr.send_command(f"CMD:PERMITIR:{tipo_acceso}")
         except Exception as exc:
             raise RuntimeError(f"No se pudo enviar CMD:PERMITIR: {exc}") from exc
 
-        paso_ok = wait_for_queue_event(
+        raw_paso = wait_for_queue_event(
             event_queue=event_queue,
             expected_type="paso",
             timeout_seconds=Config.PASO_TIMEOUT,
         )
+        paso_ok = bool(raw_paso)
     else:
-        # Para demo / modo manual
         log("Modo sin serial activo: simulando paso detectado")
         paso_ok = True
         servo_activado = False
@@ -226,7 +280,6 @@ def procesar_uid(
             except Exception as exc:
                 log(f"No se pudo enviar CMD:CERRAR tras timeout: {exc}")
 
-        log("Evento incompleto registrado")
         return
 
     # ------------------------------------------------------
@@ -241,11 +294,32 @@ def procesar_uid(
         event_dt=event_dt,
     )
 
+# REGLA SALUD: ADVERTENCIAS (Residual o Febrícula) solo si fue ENTRADA
+    if decision["modo_evento"] == "ENTRADA":
+        if Config.ALCOHOL_ADVERTENCIA <= nivel_alcohol < Config.ALCOHOL_MAX_PERMITIDO:
+            analisis["es_anomalia"] = True
+            analisis["resultado"] = "ANOMALIA"
+            analisis["motivo_codigo"] = "ALCOHOLIMETRO_ADVERTENCIA"
+            analisis["anomalia_score"] = max(analisis.get("anomalia_score", 0), 50)
+            analisis["detalle_extra"] = f"Aliento residual detectado: {nivel_alcohol}"
+            
+        elif Config.TEMP_MAX_NORMAL < temperatura < Config.TEMP_FIEBRE:
+            analisis["es_anomalia"] = True
+            analisis["resultado"] = "ANOMALIA"
+            analisis["motivo_codigo"] = "TEMPERATURA_ADVERTENCIA"
+            analisis["anomalia_score"] = max(analisis.get("anomalia_score", 0), 40)
+            analisis["detalle_extra"] = f"Febrícula detectada: {temperatura}°C"
+
     motivo_final = db.get_motivo_by_codigo(analisis["motivo_codigo"])
 
     detalle_final = decision["detalle"]
     if analisis["detalle_extra"]:
         detalle_final = f"{detalle_final} | {analisis['detalle_extra']}"
+    # --- NUEVO: Agregar evidencia de salud al log ---
+    if decision["modo_evento"] == "ENTRADA" and nivel_alcohol > 0:
+        # Solo lo agregamos si no se agregó ya como anomalía (para no repetir)
+        if "Alc:" not in detalle_final and "Temp:" not in detalle_final:
+            detalle_final = f"{detalle_final} | Alc:{nivel_alcohol} Temp:{temperatura}°C"          
     detalle_final = f"{detalle_final} | source={source}"
 
     db.insert_evento(
@@ -267,11 +341,7 @@ def procesar_uid(
     db.commit()
 
     if analisis["es_anomalia"]:
-        log(
-            f"Evento registrado como ANOMALIA | "
-            f"motivo={analisis['motivo_codigo']} | "
-            f"score={analisis['anomalia_score']}"
-        )
+        log(f"Evento registrado como ANOMALIA | motivo={analisis['motivo_codigo']} | score={analisis['anomalia_score']}")
     else:
         log(f"Evento registrado. Nuevo estado del usuario: {decision['estado_nuevo']}")
 
@@ -279,7 +349,7 @@ def procesar_uid(
         try:
             serial_mgr.send_command("CMD:CERRAR")
         except Exception as exc:
-            log(f"No se pudo enviar CMD:CERRAR: {exc}")
+            pass
 
 
 def serial_listener(
@@ -288,28 +358,46 @@ def serial_listener(
     event_queue: queue.Queue,
     stop_event: threading.Event,
 ) -> None:
-    """
-    Hilo de Escucha del Hardware (Arduino).
+    log("Hilo serial activo, esperando mensajes...")
     
-    Este hilo se dedica exclusivamente a leer el puerto serial sin bloquear el hilo principal.
-    Cuando detecta una lectura RFID o un evento de paso, lo empaqueta y lo pone en las
-    colas seguras (thread-safe) para que el hilo principal lo procese.
-    """
-    log("Hilo serial activo, esperando mensajes del Arduino...")
+    # Variables temporales para agrupar los datos de salud
+    temp_alcohol = None
+    temp_temperatura = None
 
     while not stop_event.is_set():
         try:
             msg = serial_mgr.read_line()
             if not msg:
                 continue
-
+            
             msg = msg.strip()
-            log(f"[SERIAL] {msg}")
+            if "PONG" not in msg and "MUESTREANDO" not in msg:
+                log(f"[SERIAL] {msg}")
 
             if msg.startswith("EVENTO:RFID:"):
                 uid = normalizar_uid(msg.replace("EVENTO:RFID:", "", 1))
                 if uid:
                     uid_queue.put(("rfid", uid))
+
+            # ATRAPAMOS EL ALCOHOL (Y LO GUARDAMOS TEMPORALMENTE)
+            elif msg.startswith("EVENTO:ALCOHOL:"):
+                temp_alcohol = int(msg.replace("EVENTO:ALCOHOL:", "").strip())
+
+            # ATRAPAMOS LA TEMPERATURA Y MANDAMOS EL PAQUETE COMPLETO
+            elif msg.startswith("EVENTO:TEMP:"):
+                temp_temperatura = float(msg.replace("EVENTO:TEMP:", "").strip())
+                
+                # Solo si ya leímos el alcohol milisegundos antes, armamos el paquete
+                if temp_alcohol is not None:
+                    paquete_salud = {
+                        'alcohol': temp_alcohol,
+                        'temp': temp_temperatura
+                    }
+                    event_queue.put(("salud", paquete_salud))
+                    
+                    # Limpiamos para el siguiente usuario
+                    temp_alcohol = None
+                    temp_temperatura = None
 
             elif msg == "EVENTO:PASO":
                 event_queue.put(("paso", msg))
@@ -318,22 +406,13 @@ def serial_listener(
             log(f"Error en listener serial: {exc}")
             break
 
-    log("Hilo serial finalizado")
-
 
 def console_listener(uid_queue: queue.Queue, stop_event: threading.Event) -> None:
-    """
-    Hilo de Escucha de Consola (Modo Debug/Manual).
-    
-    Permite a los desarrolladores o administradores inyectar UIDs manualmente a través
-    de la terminal para simular lecturas RFID sin necesitar el hardware físico.
-    """
     log("Hilo de consola activo. Puedes escribir UID manual o 'salir'.")
 
     while not stop_event.is_set():
         try:
             uid = input("\nUID manual (o 'salir'): ").strip()
-
             if not uid:
                 continue
 
@@ -349,12 +428,10 @@ def console_listener(uid_queue: queue.Queue, stop_event: threading.Event) -> Non
             stop_event.set()
             break
         except Exception as exc:
-            log(f"Error en listener de consola: {exc}")
+            log(f"Error en consola: {exc}")
             uid_queue.put(("system", "salir"))
             stop_event.set()
             break
-
-    log("Hilo de consola finalizado")
 
 
 def preguntar_si_usa_serial() -> bool:
@@ -364,15 +441,9 @@ def preguntar_si_usa_serial() -> bool:
             return True
         if opcion in ("n", "no"):
             return False
-        print("Respuesta no válida. Escribe 's' o 'n'.")
 
 
 def main() -> None:
-    """
-    Punto de arranque de la aplicación.
-    Configura el entorno, decide si usar hardware físico o modo de prueba,
-    levanta los hilos de escucha y comienza el loop infinito de procesamiento de eventos.
-    """
     log("Iniciando sistema...")
 
     db = Database(
@@ -397,37 +468,21 @@ def main() -> None:
                     baudrate=Config.SERIAL_BAUDRATE,
                     timeout=Config.SERIAL_TIMEOUT,
                 )
-                log(
-                    f"Serial conectado en {Config.SERIAL_PORT} "
-                    f"a {Config.SERIAL_BAUDRATE} baudios"
-                )
+                log(f"Serial conectado en {Config.SERIAL_PORT}")
             except Exception as exc:
-                log(f"No se pudo abrir el puerto serial: {exc}")
                 log("Se continuará solo con captura manual.")
                 serial_mgr = None
-        else:
-            log("Modo manual seleccionado. No se usará RFID físico por serial.")
 
         uid_queue: queue.Queue[UidEvent] = queue.Queue()
         event_queue: queue.Queue[DeviceEvent] = queue.Queue()
         stop_event = threading.Event()
 
-        t_console = threading.Thread(
-            target=console_listener,
-            args=(uid_queue, stop_event),
-            daemon=True,
-        )
+        t_console = threading.Thread(target=console_listener, args=(uid_queue, stop_event), daemon=True)
         t_console.start()
 
         if serial_mgr is not None:
-            t_serial = threading.Thread(
-                target=serial_listener,
-                args=(serial_mgr, uid_queue, event_queue, stop_event),
-                daemon=True,
-            )
+            t_serial = threading.Thread(target=serial_listener, args=(serial_mgr, uid_queue, event_queue, stop_event), daemon=True)
             t_serial.start()
-
-        log("Sistema listo. Esperando UID manual o RFID físico...")
 
         while not stop_event.is_set():
             try:
@@ -436,23 +491,14 @@ def main() -> None:
                 continue
 
             if source == "system" and uid == "salir":
-                log("Solicitud de salida recibida")
                 stop_event.set()
                 break
 
             try:
-                procesar_uid(
-                    db=db,
-                    serial_mgr=serial_mgr,
-                    punto=punto,
-                    event_queue=event_queue,
-                    uid=uid,
-                    source=source,
-                )
+                procesar_uid(db, serial_mgr, punto, event_queue, uid, source)
             except Exception as exc:
                 db.rollback()
                 log(f"Error procesando UID [{uid}]: {exc}")
-
                 if serial_mgr is not None:
                     try:
                         serial_mgr.send_command("CMD:DENEGAR")
@@ -465,16 +511,9 @@ def main() -> None:
         try:
             if 'serial_mgr' in locals() and serial_mgr is not None:
                 serial_mgr.close()
-        except Exception:
-            pass
-
-        try:
             db.close()
         except Exception:
             pass
-
-        log("Sistema finalizado")
-
 
 if __name__ == "__main__":
     main()
